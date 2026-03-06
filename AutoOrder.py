@@ -1,32 +1,37 @@
 import pandas as pd
-from tqdm import tqdm
 import numpy as np
 import json
 import os
+import queue
 from xtquant import xtconstant
-import pandas as pd
 import schedule
 from datetime import datetime
 import time
-import Trader 
+import Trader
 import Receiver
 import threading
 import base_func
 import send_trader_info
-from tabulate import tabulate
 
-# 创建实例
-with open('聚宽跟单设置.json','r+',encoding='utf-8') as f:
-        com=f.read()
-text=json.loads(com)
-password=text['密码'] 
-local_receiver_port=text['端口']
-receiver = Receiver.local_jq_data_receiver(local_port=local_receiver_port,password=password)
+# 创建信号队列（Receiver 和 AutoOrder 之间的通信桥梁）
+signal_queue = queue.Queue()
+
+# 读取配置并创建 Receiver 实例
+with open('聚宽跟单设置.json', 'r+', encoding='utf-8') as f:
+    _jq_config = json.load(f)
+
+receiver = Receiver.LocalJQDataReceiver(
+    local_port=int(_jq_config['端口']),
+    password=_jq_config['密码'],
+    decrypt_key=_jq_config['解码令牌'],
+    strategy_names=_jq_config['策略名称'],
+    signal_queue=signal_queue,
+    rate_limit=int(_jq_config.get('每分钟最大请求数', '60')),
+)
+
 def start_server_in_thread():
     """在单独线程中启动服务器"""
-    def run_server():
-        receiver.start_server()   
-    thread = threading.Thread(target=run_server, daemon=True)
+    thread = threading.Thread(target=receiver.start_server, daemon=True)
     thread.start()
 
 
@@ -46,15 +51,20 @@ class joinquant_trader:
         self.base_func = base_func.base_func()
         self.max_retry = max_retry
         self.forced_sell= forced_sell
-        #滑点
-        #self.trader.slippage=0.01
         #交易记录,补单
-        self.base_func = base_func.base_func()
         self.id_log=[]
-
+        #一次性加载配置文件
+        self.reload_config()
 
         if not self.trader.connect():
             print(" QMT交易系统连接失败，请检查配置")
+
+    def reload_config(self):
+        '''重新加载配置文件（支持运行时热更新）'''
+        with open(os.path.join(self.path, '聚宽跟单设置.json'), encoding='utf-8') as f:
+            self.jq_config = json.load(f)
+        with open(os.path.join(self.path, '分析配置.json'), encoding='utf-8') as f:
+            self.trade_config = json.load(f)
 
     def save_position(self):
         df=self.trader.get_positions()
@@ -72,9 +82,6 @@ class joinquant_trader:
         return df
     
     def get_trader_data(self,name='测试1',zh_ratio=1):
-        with open(r'{}\聚宽跟单设置.json'.format(self.path),encoding='utf-8') as f:
-            com=f.read()
-        text=json.loads(com)
         try:
             if os.path.exists(r'{}\原始数据\原始数据.csv'.format(self.path)):
                 time.sleep(2)
@@ -163,9 +170,6 @@ class joinquant_trader:
             df.to_excel(r'{}\下单股票池\下单股票池.xlsx'.format(self.path))
 
     def start_trader_on(self,name='测试1',password='123456'):
-        with open(r'{}\聚宽跟单设置.json'.format(self.path),encoding='utf-8') as f:
-            com=f.read()
-        text=json.loads(com)
         df=pd.read_excel(r'{}\下单股票池\下单股票池.xlsx'.format(self.path))
         try:
             df['证券代码']=df['证券代码'].apply(lambda x: '0'*(6-len(str(x)))+str(x))
@@ -231,22 +235,128 @@ class joinquant_trader:
             #print('{}组合没有符合调参数据'.format(name))
             return True
 
+    def process_signal(self, df):
+        '''
+        事件驱动：接收 Receiver 推送的 DataFrame，直接执行下单
+        替代原来的 CSV 轮询流程 (get_trader_data + start_trader_on)
+        '''
+        if not self.base_func.check_is_trader_date_1():
+            print('跟单{} 目前不是交易时间，信号已忽略'.format(datetime.now()))
+            return
+
+        name_list = self.jq_config['策略名称']
+        ratio_list = self.jq_config['策略跟单比例']
+
+        # 证券代码补零
+        try:
+            df['证券代码'] = df['证券代码'].apply(lambda x: '0'*(6-len(str(x)))+str(x))
+        except Exception:
+            pass
+
+        # 检查是否已经交易过
+        trader_log = self.trader.today_entrusts()
+        if trader_log.shape[0] > 0:
+            del_list = [54, 57]
+            trader_log['废单'] = trader_log['委托状态'].apply(lambda x: '是' if x in del_list else '不是')
+            trader_log = trader_log[trader_log['废单'] == '不是']
+            trader_id_list = trader_log['证券代码'].tolist() if trader_log.shape[0] > 0 else []
+        else:
+            trader_id_list = []
+
+        if df.shape[0] == 0:
+            return
+
+        # 对每个策略应用跟单比例
+        for name, ratio in zip(name_list, ratio_list):
+            df['组合跟单比例'] = ratio
+            df['交易检查'] = df['投资备注'].apply(
+                lambda x: '已经交易' if x in trader_id_list else '没有交易'
+            )
+            trade_df = df[df['交易检查'] == '没有交易'].copy()
+
+            if trade_df.shape[0] == 0:
+                continue
+
+            # 计算数量
+            amount_list = []
+            for stock, amount, trader_type in zip(
+                    trade_df['证券代码'].tolist(),
+                    trade_df['下单数量'].tolist(),
+                    trade_df['交易类型'].tolist()):
+                try:
+                    adj_amount = amount * ratio
+                    if trader_type in ['buy', 'sell'] and adj_amount >= 100:
+                        amount_list.append(adj_amount)
+                    else:
+                        amount_list.append(0)
+                except Exception as e:
+                    print(e, stock, '数量计算异常')
+                    amount_list.append(0)
+
+            trade_df['数量'] = amount_list
+            trade_df = trade_df[trade_df['数量'] >= 10]
+
+            if trade_df.shape[0] == 0:
+                continue
+
+            # 保存下单股票池（审计用途）
+            trade_df.to_excel(r'{}\\下单股票池\\下单股票池.xlsx'.format(self.path))
+            print('下单股票池（事件驱动）')
+            print(trade_df)
+
+            # 先卖后买
+            self._execute_orders(trade_df, name)
+
+    def _execute_orders(self, df, name):
+        '''执行买卖委托（先卖后买）'''
+        df['证券代码'] = df['证券代码'].astype(str)
+        df['证券代码'] = df['证券代码'].apply(lambda x: '0'*(6-len(str(x)))+str(x))
+
+        for order_type_label, order_type_filter, xt_order_type in [
+                ('卖出', 'sell', xtconstant.STOCK_SELL),
+                ('买入', 'buy', xtconstant.STOCK_BUY)]:
+            sub_df = df[df['交易类型'] == order_type_filter]
+            if sub_df.shape[0] == 0:
+                continue
+            for stock, amount, maker in zip(
+                    sub_df['证券代码'].tolist(),
+                    sub_df['数量'].tolist(),
+                    sub_df['投资备注'].tolist()):
+                if maker in self.id_log:
+                    print('{} 在订单id等待{}检查'.format(maker, order_type_label))
+                    continue
+                try:
+                    stock_price = self.base_func.get_stock_spot_data(stock=stock)
+                    price = stock_price['最新价'] if stock_price is not None else None
+                    if price is None:
+                        raise ValueError("非交易时间，无法获取有效价格")
+                    stock = self.base_func.adjust_stock(stock)
+                    self.trader.order_stock(
+                        stock_code=stock, order_type=xt_order_type,
+                        quantity=amount, price_type=xtconstant.FIX_PRICE,
+                        price=price, strategy_name=str(self.st_name[0]),
+                        remark=str(maker))
+                    self.id_log.append(maker)
+                    msg = '策略:{}\n股票:{}\n操作:{}\n价格:{}\n数量:{}\n时间:{}'.format(
+                        self.st_name, stock, order_type_label, price, amount, datetime.now())
+                    self.seed_msg(text=msg)
+                except Exception as e:
+                    print(e)
+                    print('组合{} {}{}有问题'.format(name, stock, order_type_label))
+
     def update_all_data(self):
         '''
-        更新策略数据
+        更新策略数据（保留作为兼容方法，主要用于手动调用）
         '''
-        if 1>0:
-            with open(r'{}\聚宽跟单设置.json'.format(self.path),encoding='utf-8') as f:
-                com=f.read()
-            text=json.loads(com)
-            name_list=text['策略名称']
-            ratio_list=text['策略跟单比例']
+        if self.base_func.check_is_trader_date_1():
+            name_list=self.jq_config['策略名称']
+            ratio_list=self.jq_config['策略跟单比例']
             password=['密码']
             for name,ratio in zip(name_list,ratio_list):
                 self.get_trader_data(name=name,zh_ratio=ratio)
                 self.start_trader_on(name=name,password=password)
         else:
-            print('跟单{} 目前不是交易时间***************'.format(datetime.now()))
+            print('跟单{} 目前不是交易时间'.format(datetime.now()))
 
     def get_remove_maker_id(self):
         '''
@@ -265,12 +375,14 @@ class joinquant_trader:
         else:
             trader_id_list=[]
         if len(self.id_log)>0:
+            new_id_log = []
             for maker in self.id_log:
-                if  maker not in trader_id_list:
-                    self.id_log.remove(maker)
+                if maker not in trader_id_list:
                     print(maker,'不在委托记录移除交易记录')
                 else:
+                    new_id_log.append(maker)
                     print(maker,'在委托记录不移除交易记录')
+            self.id_log = new_id_log
         else:
             #print('没有问题交易记录数据')
             return True
@@ -292,6 +404,8 @@ class joinquant_trader:
                     trader_log=trader_log[trader_log['不成交']=='是']
                 else:
                     trader_log=trader_log
+                if trader_log.shape[0]==0:
+                    return True
                 name_list=[self.st_name]
                 try:
                     trader_log['去重键'] = trader_log['委托备注'].apply(lambda x:get_remark_key(x))
@@ -470,10 +584,7 @@ class joinquant_trader:
         '''
         msg=text
         msg+=','
-        with open('分析配置.json','r+',encoding='utf-8') as f:
-            com=f.read()
-        text=json.loads(com)
-        wx_token_list=text['微信token']
+        wx_token_list=self.trade_config['微信token']
         seed=send_trader_info.send_info(wx_token_list)
         seed.seed_wechat(msg)
 
@@ -517,29 +628,34 @@ if __name__=='__main__':
     st_name=text_a['策略名称']
     max_retry=int(text_a['最大重新下单次数'])
     forced_sell=int(text_a['触发强制卖出次数'])
-    
 
-  
     trader=joinquant_trader(qmt_path=qmt_path,qmt_account=qmt_account,st_name=st_name,qmt_account_type=qmt_account_type,
-                            local_receiver_port=local_receiver_port,max_retry=max_retry, forced_sell=forced_sell)
+                            local_receiver_port=int(_jq_config['端口']),max_retry=max_retry, forced_sell=forced_sell)
     #打印账户信息
     print(trader.save_balance())
     print(trader.save_position())
     #启动监听服务
     start_server_in_thread()
-    #检查交易信号
-    schedule.every(0.05).minutes.do(trader.update_all_data)
-    #10秒检查一下订单
+
+    #定时任务：撤单重挂、订单清理、日终摘要（保持轮询）
     schedule.every(0.2).minutes.do(trader.get_remove_maker_id)
-    #45秒撤单了在下单(检查挂单未交易前sleep(15)避免刚挂单就撤单)
     schedule.every(0.5).minutes.do(trader.run_order_trader_func)
-    #对应时间发送一下摘要
     schedule.every().day.at(summary_message).do(trader.trade_summary)
-    #开板卖出
-    #schedule.every(0.06).minutes.do(trader.run_get_check_open_zt)
+
+    print('✅ 系统就绪，下单链路已切换为事件驱动模式')
+    print('✅ 撤单重挂、12秒订单检查、30秒撤单检查仍为定时轮询')
+
+    #主循环：从队列消费信号 + 执行定时任务
     while True:
+        # 执行定时任务（撤单重挂、订单清理、摘要）
         schedule.run_pending()
-        if is_trading_time():
-            time.sleep(1)   # 交易时间段：1秒间隔
-        else:
-            time.sleep(360) # 非交易时间：10分钟间隔
+
+        # 从队列获取交易信号（非阻塞，快速轮转）
+        try:
+            signal_df = signal_queue.get(timeout=1)
+            print('\n▶ 收到交易信号，立即执行下单...')
+            trader.process_signal(signal_df)
+        except queue.Empty:
+            pass
+        except Exception as e:
+            print(f'处理交易信号异常: {e}')

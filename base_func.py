@@ -65,19 +65,7 @@ class base_func:
             return 'fund'
         else:
             return 'stock'
-    def adjust_stock(self,stock='600031.SH'):
-        '''
-        调整代码
-        '''
-        if stock[-2:]=='SH' or stock[-2:]=='SZ' or stock[-2:]=='sh' or stock[-2:]=='sz':
-            stock=stock.upper()
-        else:
-            if stock[:3] in ['600','601','603','688','510','511',
-                             '512','513','515','113','110','118','501'] or stock[:2] in ['11']:
-                stock=stock+'.SH'
-            else:
-                stock=stock+'.SZ'
-        return stock
+
     def adjust_amount(self,stock='',amount=''):
         '''
         调整数量
@@ -242,182 +230,86 @@ class base_func:
     
 
 
-    def get_stock_spot_data(self,stock):
+    def _fetch_from_eastmoney(self, stock, market_code=0):
+        '''
+        从东方财富获取实时行情（内部方法）
+        market_code: 0=深市, 1=沪市
+        '''
+        stock_code = str(stock)[:6]
+        secid = '{}.{}'.format(market_code, stock_code)
+        params = {
+            'invt': '2',
+            'fltt': '1',
+            'cb': 'jQuery3510180390237681324_1685191053405',
+            'fields': 'f58,f107,f57,f43,f59,f169,f170,f152,f46,f60,f44,f45,f47,f48,f161,f49,f171,f50,f86,f177,f111,f51,f52,f168,f116,f117,f167,f162,f262',
+            'secid': secid,
+            'ut': 'fa5fd1943c7b386f172d6893dbfba10b',
+            'wbp2u': '1452376043169950|0|1|0|web',
+            '_': '1685191053406',
+        }
+        url = 'http://push2.eastmoney.com/api/qt/stock/get?'
+        res = requests.get(url=url, params=params)
+        text = res.text[40:-2]
+        data = json.loads(text)['data']
+        result = {}
+        result['最新价'] = data['f43'] / 100
+        result['最高价'] = data['f44'] / 100
+        result['最低价'] = data['f45'] / 100
+        result['今开'] = data['f46'] / 100
+        result['成交量'] = data['f47']
+        result['成交额'] = data['f48']
+        result['量比'] = data['f50'] / 100
+        result['涨停'] = data['f51'] / 100
+        result['跌停'] = data['f52'] / 100
+        result['证券代码'] = data['f57']
+        result['股票名称'] = data['f58']
+        result['昨收'] = data['f60'] / 100
+        result['总市值'] = data['f116']
+        result['流通市值'] = data['f117']
+        result['换手率'] = data['f168'] / 100
+        result['涨跌幅'] = data['f170'] / 100
+        return result
+
+    def _fetch_from_eastmoney_with_fallback(self, stock):
+        '''
+        从东方财富获取行情，先尝试深市(0)再尝试沪市(1)
+        '''
+        for market_code in [0, 1]:
+            try:
+                return self._fetch_from_eastmoney(stock, market_code)
+            except Exception:
+                continue
+        return None
+
+    def get_stock_spot_data(self, stock):
         '''
         获取股票实时数据
+        优先使用QMT数据源，失败则回退到东方财富
         '''
-        if self.check_is_trader_date_1()==False:
+        if self.check_is_trader_date_1() == False:
             return None
         try:
-            stock_1=self.adjust_stock(stock=stock)
-            tick=xtdata.get_full_tick(code_list=[stock_1])
-            tick=tick[stock_1]
-            if len(tick)>0:
-                result={}
-                result['证券代码']=stock
-                result['时间']=tick['timetag']
-                result['最新价']=tick['lastPrice']
-                result['今开']=tick['open']
-                result['最高价']=tick['high']
-                result['最低价']=tick['low']
-                result['昨收']=tick['lastClose']
-                result['成交量']=tick['amount']
-                result['成交额']=tick['volume']
-                result['涨跌幅']=((tick['lastPrice']-tick['lastClose'])/tick['lastClose'])*100
+            stock_1 = self.adjust_stock(stock=stock)
+            tick = xtdata.get_full_tick(code_list=[stock_1])
+            tick = tick[stock_1]
+            if len(tick) > 0:
+                result = {}
+                result['证券代码'] = stock
+                result['时间'] = tick['timetag']
+                result['最新价'] = tick['lastPrice']
+                result['今开'] = tick['open']
+                result['最高价'] = tick['high']
+                result['最低价'] = tick['low']
+                result['昨收'] = tick['lastClose']
+                result['成交量'] = tick['amount']
+                result['成交额'] = tick['volume']
+                result['涨跌幅'] = ((tick['lastPrice'] - tick['lastClose']) / tick['lastClose']) * 100
                 return result
             else:
-                try:
-                    stock=str(stock)[:6]
-                    secid='{}.{}'.format(0,stock)
-                    params={
-                        'invt':'2',
-                        'fltt':'1',
-                        'cb':'jQuery3510180390237681324_1685191053405',
-                        'fields':'f58,f107,f57,f43,f59,f169,f170,f152,f46,f60,f44,f45,f47,f48,f161,f49,f171,f50,f86,f177,f111,f51,f52,f168,f116,f117,f167,f162,f262',
-                        'secid': secid,
-                        'ut': 'fa5fd1943c7b386f172d6893dbfba10b',
-                        'wbp2u': '1452376043169950|0|1|0|web',
-                        '_': '1685191053406',
-                    }
-                    url='http://push2.eastmoney.com/api/qt/stock/get?'
-                    res=requests.get(url=url,params=params)
-                    text=res.text
-                    text=text[40:len(text)-2]
-                    json_text=json.loads(text)
-                    data=json_text['data']
-                    result={}
-                    result['最新价']=data['f43']/100
-                    result['最高价']=data['f44']/100
-                    result['最低价']=data['f45']/100
-                    result['今开']=data['f46']/100
-                    result['成交量']=data['f47']
-                    result['成交额']=data['f48']
-                    result['量比']=data['f50']/100
-                    result['涨停']=data['f51']/100
-                    result['跌停']=data['f52']/100
-                    result['证券代码']=data['f57']
-                    result['股票名称'] = data['f58']
-                    result['昨收']=data['f60']/100
-                    result['总市值']=data['f116']
-                    result['流通市值']=data['f117']
-                    result['换手率']=data['f168']/100
-                    result['涨跌幅']=data['f170']/100
-                    return result
-                except:
-                    
-                    stock=str(stock)[:6]
-                    secid='{}.{}'.format(1,stock)
-                    params={
-                            'invt':'2',
-                            'fltt':'1',
-                            'cb':'jQuery3510180390237681324_1685191053405',
-                            'fields':'f58,f107,f57,f43,f59,f169,f170,f152,f46,f60,f44,f45,f47,f48,f161,f49,f171,f50,f86,f177,f111,f51,f52,f168,f116,f117,f167,f162,f262',
-                            'secid': secid,
-                            'ut': 'fa5fd1943c7b386f172d6893dbfba10b',
-                            'wbp2u': '1452376043169950|0|1|0|web',
-                            '_': '1685191053406',
-                    }
-                    url='http://push2.eastmoney.com/api/qt/stock/get?'
-                    res=requests.get(url=url,params=params)
-                    text=res.text
-                    text=text[40:len(text)-2]
-                    json_text=json.loads(text)
-                    data=json_text['data']
-                    result={}
-                    result['最新价']=data['f43']/100
-                    result['最高价']=data['f44']/100
-                    result['最低价']=data['f45']/100
-                    result['今开']=data['f46']/100
-                    result['成交量']=data['f47']
-                    result['成交额']=data['f48']
-                    result['量比']=data['f50']/100
-                    result['涨停']=data['f51']/100
-                    result['跌停']=data['f52']/100
-                    result['证券代码']=data['f57']
-                    result['股票名称'] = data['f58']
-                    result['昨收']=data['f60']/100
-                    result['总市值']=data['f116']
-                    result['流通市值']=data['f117']
-                    result['换手率']=data['f168']/100
-                    result['涨跌幅']=data['f170']/100
-                    return result
+                return self._fetch_from_eastmoney_with_fallback(stock)
         except Exception as e:
-            print(e,stock,'qmt实时数据获取有问题切换到东方财富')
-            try:
-                stock=str(stock)[:6]
-                secid='{}.{}'.format(0,stock)
-                params={
-                    'invt':'2',
-                    'fltt':'1',
-                    'cb':'jQuery3510180390237681324_1685191053405',
-                    'fields':'f58,f107,f57,f43,f59,f169,f170,f152,f46,f60,f44,f45,f47,f48,f161,f49,f171,f50,f86,f177,f111,f51,f52,f168,f116,f117,f167,f162,f262',
-                    'secid': secid,
-                    'ut': 'fa5fd1943c7b386f172d6893dbfba10b',
-                    'wbp2u': '1452376043169950|0|1|0|web',
-                    '_': '1685191053406',
-                }
-                url='http://push2.eastmoney.com/api/qt/stock/get?'
-                res=requests.get(url=url,params=params)
-                text=res.text
-                text=text[40:len(text)-2]
-                json_text=json.loads(text)
-                data=json_text['data']
-                result={}
-                result['最新价']=data['f43']/100
-                result['最高价']=data['f44']/100
-                result['最低价']=data['f45']/100
-                result['今开']=data['f46']/100
-                result['成交量']=data['f47']
-                result['成交额']=data['f48']
-                result['量比']=data['f50']/100
-                result['涨停']=data['f51']/100
-                result['跌停']=data['f52']/100
-                result['证券代码']=data['f57']
-                result['股票名称'] = data['f58']
-                result['昨收']=data['f60']/100
-                result['总市值']=data['f116']
-                result['流通市值']=data['f117']
-                result['换手率']=data['f168']/100
-                result['涨跌幅']=data['f170']/100
-                return result
-            except:
-                
-                stock=str(stock)[:6]
-                secid='{}.{}'.format(1,stock)
-                params={
-                        'invt':'2',
-                        'fltt':'1',
-                        'cb':'jQuery3510180390237681324_1685191053405',
-                        'fields':'f58,f107,f57,f43,f59,f169,f170,f152,f46,f60,f44,f45,f47,f48,f161,f49,f171,f50,f86,f177,f111,f51,f52,f168,f116,f117,f167,f162,f262',
-                        'secid': secid,
-                        'ut': 'fa5fd1943c7b386f172d6893dbfba10b',
-                        'wbp2u': '1452376043169950|0|1|0|web',
-                        '_': '1685191053406',
-                }
-                url='http://push2.eastmoney.com/api/qt/stock/get?'
-                res=requests.get(url=url,params=params)
-                text=res.text
-                text=text[40:len(text)-2]
-                json_text=json.loads(text)
-                data=json_text['data']
-                result={}
-                result['最新价']=data['f43']/100
-                result['最高价']=data['f44']/100
-                result['最低价']=data['f45']/100
-                result['今开']=data['f46']/100
-                result['成交量']=data['f47']
-                result['成交额']=data['f48']
-                result['量比']=data['f50']/100
-                result['涨停']=data['f51']/100
-                result['跌停']=data['f52']/100
-                result['证券代码']=data['f57']
-                result['股票名称'] = data['f58']
-                result['昨收']=data['f60']/100
-                result['总市值']=data['f116']
-                result['流通市值']=data['f117']
-                result['换手率']=data['f168']/100
-                result['涨跌幅']=data['f170']/100
-                return result
+            print(e, stock, 'qmt实时数据获取有问题切换到东方财富')
+            return self._fetch_from_eastmoney_with_fallback(stock)
 
 
 
