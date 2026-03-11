@@ -284,7 +284,7 @@ class joinquant_trader:
                     trade_df['下单数量'].tolist(),
                     trade_df['交易类型'].tolist()):
                 try:
-                    adj_amount = amount * ratio
+                    adj_amount = float(amount) * float(ratio)  # 强制转 float，避免字段为字符串时报错
                     if trader_type in ['buy', 'sell'] and adj_amount >= 100:
                         amount_list.append(adj_amount)
                     else:
@@ -523,8 +523,12 @@ class joinquant_trader:
 
     def trade_summary(self):
         if self.base_func.check_is_trader_date_1():
+            summary_path = r'.\摘要数据\摘要数据.csv'
             try:
-                df_joinquant = pd.read_csv(r'.\摘要数据\摘要数据.csv')
+                if not os.path.exists(summary_path):
+                    self.seed_msg(text="心跳信号：交易时间，今日无交易信号")
+                    return
+                df_joinquant = pd.read_csv(summary_path)
                 self.cls_summary_file()
                 df_qmt = self.trader.today_trades()
             except Exception as e:
@@ -565,6 +569,11 @@ class joinquant_trader:
                 print(f"发送当日交易摘要失败：{e}")
         else:
             self.seed_msg(text="心跳信号：非交易时间，程序正常运行")
+
+    def state_check(self):
+        msg="心跳信号：当前程序状态正常，等待股市开盘"
+        self.seed_msg(text=msg)
+        return True
 
     def cls_file(self):
         file_path = './原始数据/原始数据.csv'
@@ -622,6 +631,7 @@ if __name__=='__main__':
     qmt_path=text['qmt路径']
     qmt_account_type=text['交易品种']
     summary_message=text['发送摘要时间']
+    check_state_time=text['程序自检通知']
     with open('聚宽跟单设置.json','r+',encoding='utf-8') as f:
         com=f.read()
     text_a=json.loads(com)
@@ -641,7 +651,8 @@ if __name__=='__main__':
     schedule.every(0.2).minutes.do(trader.get_remove_maker_id)
     schedule.every(0.5).minutes.do(trader.run_order_trader_func)
     schedule.every().day.at(summary_message).do(trader.trade_summary)
-
+    #对应时间发送程序当前状态
+    schedule.every().day.at(check_state_time).do(trader.state_check)
     print('✅ 系统就绪，下单链路已切换为事件驱动模式')
     print('✅ 撤单重挂、12秒订单检查、30秒撤单检查仍为定时轮询')
 
